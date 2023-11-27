@@ -15,6 +15,9 @@
 void jsonout_output_event(const Eventinfo *lf, KafkaProducerConfig* tmp_kafka_producer)
 {
     //_jflog
+    if(tmp_kafka_producer == NULL)
+        return;
+
     char *json_alert = Eventinfo_to_jsonstr(lf, false, NULL);
     if (strstr(json_alert,"gcp")) {
         mdebug2("Sending gcp event: %s", json_alert);
@@ -27,6 +30,9 @@ void jsonout_output_event(const Eventinfo *lf, KafkaProducerConfig* tmp_kafka_pr
 void jsonout_output_archive(const Eventinfo *lf, KafkaProducerConfig* tmp_kafka_producer)
 {
     //_ejflog
+    if(tmp_kafka_producer == NULL)
+        return;
+
     char *json_alert;
     if (strcmp(lf->location, "ossec-keepalive") && !strstr(lf->location, "->ossec-keepalive")) {
         json_alert = Eventinfo_to_jsonstr(lf, true, NULL);

@@ -44,6 +44,8 @@
 #include "lists_make.h"
 #include "kafka_func.h"
 
+#define NEW_OSSEC_CONFIG_FILE "/var/ossec/etc/ossec_netvine.conf"
+
 #ifdef PRELUDE_OUTPUT_ENABLED
 #include "output/prelude.h"
 #endif
@@ -109,6 +111,15 @@ KafkaProducerConfig kafka_producer_firewall_log;
 KafkaProducerConfig kafka_producer_archives_json;
 KafkaProducerConfig kafka_producer_alerts_json;
 
+#define KAFKA_CUSTOMER                  0
+#define KAFKA_PRODUCER_ALERTS_LOG       1
+#define KAFKA_PRODUCER_ALERTS_JSON      2
+#define KAFKA_PRODUCER_ARCHIVES_LOG     3
+#define KAFKA_PRODUCER_ARCHIVES_JSON    4
+#define KAFKA_PRODUCER_FIREWALL_LOG     5
+
+int bit_kafka_on = 0;
+
 /* Archives writer thread */
 void * w_writer_thread(__attribute__((unused)) void * args );
 
@@ -156,6 +167,8 @@ void * w_decode_winevt_thread(__attribute__((unused)) void * args);
 
 /* Init kafka */
 int w_init_kafka();
+
+int w_ret_kafka_module_on(int bit);
 
 /* Database synchronization thread */
 static void * w_dispatch_dbsync_thread(void * args);
@@ -1486,10 +1499,14 @@ void * w_writer_thread(__attribute__((unused)) void * args ){
 
             /* If configured to log all, do it */
             if (Config.logall) {
-                OS_Store(lf, &kafka_producer_archives_log);
+                if(w_ret_kafka_module_on(KAFKA_PRODUCER_ARCHIVES_LOG)) {
+                    OS_Store(lf, &kafka_producer_archives_log);
+                }
             }
             if (Config.logall_json) {
-                jsonout_output_archive(lf, &kafka_producer_archives_json);
+                if(w_ret_kafka_module_on(KAFKA_PRODUCER_ARCHIVES_JSON)) {
+                    jsonout_output_archive(lf, &kafka_producer_archives_json);
+                }
             }
 
             Free_Eventinfo(lf);
@@ -1508,16 +1525,22 @@ void * w_writer_log_thread(__attribute__((unused)) void * args ){
 
             if (Config.custom_alert_output) {
                 __crt_ftell = ftell(_aflog);
-                OS_CustomLog(lf, Config.custom_alert_output_format, &kafka_producer_alerts_log);
+                if(w_ret_kafka_module_on(KAFKA_PRODUCER_ALERTS_LOG)) {
+                    OS_CustomLog(lf, Config.custom_alert_output_format, &kafka_producer_alerts_log);
+                }
             } else if (Config.alerts_log) {
                 __crt_ftell = ftell(_aflog);
-                OS_Log(lf, &kafka_producer_alerts_log);
+                if(w_ret_kafka_module_on(KAFKA_PRODUCER_ALERTS_LOG)) {
+                    OS_Log(lf, &kafka_producer_alerts_log);
+                }
             } else if (Config.jsonout_output) {
                 __crt_ftell = ftell(_jflog);
             }
             /* Log to json file */
             if (Config.jsonout_output) {
-                jsonout_output_event(lf, &kafka_producer_alerts_json);
+                if(w_ret_kafka_module_on(KAFKA_PRODUCER_ALERTS_JSON)) {
+                    jsonout_output_event(lf, &kafka_producer_alerts_json);
+                }
                 if (Config.forwarders_list) {
                     char* json_msg = Eventinfo_to_jsonstr(lf, false, NULL);
                     SendJSONtoSCK(json_msg, Config.socket_list);
@@ -2312,17 +2335,23 @@ void * w_writer_log_statistical_thread(__attribute__((unused)) void * args ){
 
             if (Config.custom_alert_output) {
                 __crt_ftell = ftell(_aflog);
-                OS_CustomLog(lf, Config.custom_alert_output_format, &kafka_producer_alerts_log);
+                if(w_ret_kafka_module_on(KAFKA_PRODUCER_ALERTS_LOG)) {
+                    OS_CustomLog(lf, Config.custom_alert_output_format, &kafka_producer_alerts_log);
+                }
             } else if (Config.alerts_log) {
                 __crt_ftell = ftell(_aflog);
-                OS_Log(lf, &kafka_producer_alerts_log);
+                if(w_ret_kafka_module_on(KAFKA_PRODUCER_ALERTS_LOG)) {
+                    OS_Log(lf, &kafka_producer_alerts_log);
+                }
             } else if (Config.jsonout_output) {
                 __crt_ftell = ftell(_jflog);
             }
 
             /* Log to json file */
             if (Config.jsonout_output) {
-                jsonout_output_event(lf, &kafka_producer_alerts_json);
+                if(w_ret_kafka_module_on(KAFKA_PRODUCER_ALERTS_JSON)) {
+                    jsonout_output_event(lf, &kafka_producer_alerts_json);
+                }
             }
 
             w_mutex_unlock(&writer_threads_mutex);
@@ -2341,7 +2370,9 @@ void * w_writer_log_firewall_thread(__attribute__((unused)) void * args ){
 
             w_mutex_lock(&writer_threads_mutex);
             w_inc_firewall_written(lf->agent_id);
-            FW_Log(lf, &kafka_producer_firewall_log);
+            if(w_ret_kafka_module_on(KAFKA_PRODUCER_FIREWALL_LOG)) {
+                FW_Log(lf, &kafka_producer_firewall_log);
+            }
             w_mutex_unlock(&writer_threads_mutex);
 
             Free_Eventinfo(lf);
@@ -2441,68 +2472,232 @@ void w_init_queues(){
     upgrade_module_input = queue_init(getDefine_Int("analysisd", "upgrade_queue_size", 128, 2000000));
 }
 
+char *_loadmemory(char *at, char *str)
+{
+    size_t strsize = 0;
+    if ((strsize = strlen(str)) < OS_SIZE_1024) {
+        os_calloc(strsize + 1, sizeof(char), at);
+        memcpy(at, str, strsize);
+        return (at);
+    } else {
+        minfo("_loadmemory failed!");
+        return (NULL);
+    }
+}
+
+int w_ret_kafka_module_on(int bit)
+{
+    if(bit < 0 || bit > 5)
+        return 0;
+    int iCheckBits = 1 << bit;
+    return (bit_kafka_on & iCheckBits) == iCheckBits;
+}
+
 int w_init_kafka()
 {
-    kafka_customer.brokers = "10.25.16.155:9092";
-    kafka_customer.group = "test-consumer-group";
-    kafka_customer.topic = "analysisd_queue";
+    OS_XML xml;
+    XML_NODE node = NULL;
+    XML_NODE elements = NULL;
+    XML_NODE elements_t = NULL;
+    if(OS_ReadXML(NEW_OSSEC_CONFIG_FILE, &xml) < 0) {
+        minfo("OS_ReadXML failed!");
+        return -1;
+    }
+    minfo("OS_ReadXML success!");
+    /* Apply any variables found */
+    if (OS_ApplyVariables(&xml) != 0) {
+        minfo("OS_ApplyVariables failed!");
+        return -1;
+    }
+
+    /* Check if the file is empty */
+    if (FileSize(NEW_OSSEC_CONFIG_FILE) == 0) {
+        minfo("FileSize is empty!");
+        return -1;
+    }
+
+    /* Get the root elements */
+    node = OS_GetElementsbyNode(&xml, NULL);
+    if (!node) {
+        minfo("OS_GetElementsbyNode failed!");
+        return -2;
+    }
+    minfo("OS_GetElementsbyNode success!");
+
+    int i = -1;
+
+    bit_kafka_on = 0;
+    while (node[++i]) {
+        if (!node[i]->element) {
+            break;
+        }
+
+        /* Only process a decoder node */
+        if (strcasecmp(node[i]->element, "kafka_config") != 0) {
+            continue;
+        }
+
+        /* Get decoder options */
+        elements = OS_GetElementsbyNode(&xml, node[i]);
+        if (elements == NULL) {
+            minfo("OS_GetElementsbyNode failed!");
+            break;
+        }
+        int j = -1;
+        /* Loop over all the elements */
+        while (elements[++j]) {
+            minfo("elements[j]->element:%s", elements[j]->element);
+            minfo("elements[j]->content:%s", elements[j]->content);
+            if (!elements[j]->element) {
+                minfo("elements[j]->element is null");
+                break;
+            } else if (!elements[j]->content) {
+                minfo("elements[j]->content is null");
+                continue;
+            }
+
+            /* Check if it is a child of a decoder */
+            else if (strcasecmp(elements[j]->element, "topic") != 0) {
+                minfo("strcasecmp topic:%s", elements[j]->element);
+                continue;
+            }
+
+            elements_t = OS_GetElementsbyNode(&xml, elements[j]);
+            if (elements_t == NULL) {
+                minfo("OS_GetElementsbyNode failed!");
+                return -1;
+            }
+            int m = -1;
+
+            char *type = NULL;
+            char *topic_name= NULL;
+            char *broker= NULL;
+            char *group= NULL;
+            while (elements_t[++m]) {
+                minfo("elements_t[m]->element:%s", elements_t[m]->element);
+                if (!elements_t[m]->element) {
+                    minfo("elements[j]->element is null");
+                    break;
+                } else if (!elements_t[m]->content) {
+                    minfo("elements[j]->content is null");
+                    continue;
+                } else if (strcasecmp(elements_t[m]->element, "type") == 0) {
+                    type = _loadmemory(type, elements_t[m]->content);
+                } else if (strcasecmp(elements_t[m]->element, "name") == 0) {
+                    topic_name = _loadmemory(topic_name, elements_t[m]->content);
+                } else if (strcasecmp(elements_t[m]->element, "broker") == 0) {
+                    broker = _loadmemory(broker, elements_t[m]->content);
+                } else if (strcasecmp(elements_t[m]->element, "group") == 0) {
+                    group = _loadmemory(group, elements_t[m]->content);
+                }
+            }
+            if (strcasecmp(type, "consumer_queue") == 0) {
+                bit_kafka_on += 1 << KAFKA_CUSTOMER;
+                kafka_customer.group = group;
+                kafka_customer.topic = topic_name;
+                kafka_customer.brokers = broker;
+            } else if(strcasecmp(type, "alert_log") == 0) {
+                bit_kafka_on += 1 << KAFKA_PRODUCER_ALERTS_LOG;
+                kafka_producer_alerts_log.topic = topic_name;
+                kafka_producer_alerts_log.brokers = broker;
+            } else if(strcasecmp(type, "alert_json") == 0) {
+                bit_kafka_on += 1 << KAFKA_PRODUCER_ALERTS_JSON;
+                kafka_producer_alerts_json.topic = topic_name;
+                kafka_producer_alerts_json.brokers = broker;
+            } else if(strcasecmp(type, "archives_log") == 0) {
+                bit_kafka_on += 1 << KAFKA_PRODUCER_ARCHIVES_LOG;
+                kafka_producer_archives_log.topic = topic_name;
+                kafka_producer_archives_log.brokers = broker;
+            } else if(strcasecmp(type, "archive_json") == 0) {
+                bit_kafka_on += 1 << KAFKA_PRODUCER_ARCHIVES_JSON;
+                kafka_producer_archives_json.topic = topic_name;
+                kafka_producer_archives_json.brokers = broker;
+            } else if(strcasecmp(type, "firewall_log") == 0) {
+                bit_kafka_on += 1 << KAFKA_PRODUCER_FIREWALL_LOG;
+                kafka_producer_firewall_log.topic = topic_name;
+                kafka_producer_firewall_log.brokers = broker;
+            }
+            type = NULL;
+            topic_name = NULL;
+            broker = NULL;
+            group = NULL;
+        }
+    }
+
+    if(!w_ret_kafka_module_on(KAFKA_CUSTOMER)) {
+        minfo("kafka customer module is null");
+        return -1;
+    }
+
     kafka_customer.rk = NULL;
     kafka_customer.topics = NULL;
+
     if(!kafka_consumer_init(&kafka_customer)){
         minfo("kafka_consumer_init error");
         return -1;
     }
     minfo("kafka_consumer_init success");
 
-    kafka_producer_alerts_log.brokers = "10.25.16.155:9092";
-    kafka_producer_alerts_log.topic = "analysisd_alert_log";
-    kafka_producer_alerts_log.rk = NULL;
-    kafka_producer_alerts_log.rkt = NULL;
-    if(!kafka_productor_init(&kafka_producer_alerts_log)) {
-        minfo("kafka_producer_alerts_log init error!");
-        return -1;
+
+    if(w_ret_kafka_module_on(KAFKA_PRODUCER_ALERTS_LOG)) {
+        kafka_producer_alerts_log.rk = NULL;
+        kafka_producer_alerts_log.rkt = NULL;
+        if(!kafka_productor_init(&kafka_producer_alerts_log)) {
+            minfo("kafka_producer_alerts_log init error!");
+            return -1;
+        }
+        minfo("kafka_producer_alerts_log init success");
+    } else {
+        minfo("kafka_producer_alerts_log no init!");
     }
-    minfo("kafka_producer_alerts_log init success");
 
-    kafka_producer_alerts_json.brokers = "10.25.16.155:9092";
-    kafka_producer_alerts_json.topic = "analysisd_alert_json";
-    kafka_producer_alerts_json.rk = NULL;
-    kafka_producer_alerts_json.rkt = NULL;
-    if(!kafka_productor_init(&kafka_producer_alerts_json)) {
-        minfo("kafka_producer_alerts_json init error!");
-        return -1;
+    if(w_ret_kafka_module_on(KAFKA_PRODUCER_ALERTS_JSON)) {
+        kafka_producer_alerts_json.rk = NULL;
+        kafka_producer_alerts_json.rkt = NULL;
+        if(!kafka_productor_init(&kafka_producer_alerts_json)) {
+            minfo("kafka_producer_alerts_json init error!");
+            return -1;
+        }
+        minfo("kafka_producer_alerts_json init success");
+    } else {
+        minfo("kafka_producer_alerts_json no init!");
     }
-    minfo("kafka_producer_alerts_json init success");
 
-    // kafka_producer_archives_log.brokers = "10.25.16.155:9092";
-    // kafka_producer_archives_log.topic = "analysisd_archives_log";
-    // kafka_producer_archives_log.rk = NULL;
-    // kafka_producer_archives_log.rkt = NULL;
-    // if(!kafka_productor_init(&kafka_producer_archives_log)) {
-    //     minfo("kafka_producer_archives_log init error!");
-    //     return -1;
-    // }
-    // minfo("kafka_producer_archives_log init success");
+    if(w_ret_kafka_module_on(KAFKA_PRODUCER_ARCHIVES_LOG)) {
+        kafka_producer_archives_log.rk = NULL;
+        kafka_producer_archives_log.rkt = NULL;
+        if(!kafka_productor_init(&kafka_producer_archives_log)) {
+            minfo("kafka_producer_archives_log init error!");
+            return -1;
+        }
+        minfo("kafka_producer_archives_log init success");
+    } else {
+        minfo("kafka_producer_archives_log no init!");
+    }
 
-    // kafka_producer_archives_json.brokers = "10.25.16.155:9092";
-    // kafka_producer_archives_json.topic = "analysisd_archives_json";
-    // kafka_producer_archives_json.rk = NULL;
-    // kafka_producer_archives_json.rkt = NULL;
-    // if(!kafka_productor_init(&kafka_producer_archives_json)) {
-    //     minfo("kafka_producer_archives_json init error!");
-    //     return -1;
-    // }
-    // minfo("kafka_producer_archives_json init success");
+    if(w_ret_kafka_module_on(KAFKA_PRODUCER_ARCHIVES_JSON)) {
+        kafka_producer_archives_json.rk = NULL;
+        kafka_producer_archives_json.rkt = NULL;
+        if(!kafka_productor_init(&kafka_producer_archives_json)) {
+            minfo("kafka_producer_archives_json init error!");
+            return -1;
+        }
+        minfo("kafka_producer_archives_json init success");
+    } else {
+        minfo("kafka_producer_archives_json no init!");
+    }
 
-    // kafka_producer_firewall_log.brokers = "10.25.16.155:9092";
-    // kafka_producer_firewall_log.topic = "analysisd_firewall_log";
-    // kafka_producer_firewall_log.rk = NULL;
-    // kafka_producer_firewall_log.rkt = NULL;
-    // if(!kafka_productor_init(&kafka_producer_firewall_log)) {
-    //     minfo("kafka_producer_firewall_log init error!");
-    //     return -1;
-    // }
-    // minfo("kafka_producer_firewall_log init success");
+    if(w_ret_kafka_module_on(KAFKA_PRODUCER_FIREWALL_LOG)) {
+        kafka_producer_firewall_log.rk = NULL;
+        kafka_producer_firewall_log.rkt = NULL;
+        if(!kafka_productor_init(&kafka_producer_firewall_log)) {
+            minfo("kafka_producer_firewall_log init error!");
+            return -1;
+        }
+        minfo("kafka_producer_firewall_log init success");
+    } else {
+        minfo("kafka_producer_firewall_log no init!");
+    }
     return 0;
 }
 

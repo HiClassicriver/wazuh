@@ -78,6 +78,9 @@ static void format_labels(char *buffer, size_t size, const Eventinfo *lf) {
 void OS_Store(const Eventinfo *lf, KafkaProducerConfig* tmp_kafka_producer)
 {
     //_eflog
+    if(tmp_kafka_producer == NULL)
+        return;
+
     if (strcmp(lf->location, "ossec-keepalive") == 0) {
         return;
     }
@@ -107,6 +110,9 @@ void OS_Store_Flush(){
 
 void OS_Log(Eventinfo *lf, KafkaProducerConfig* tmp_kafka_producer)
 {
+    if(tmp_kafka_producer == NULL)
+        return;
+
     mdebug2("OS_Log start!");
     int i;
     char labels[OS_MAXSTR] = {0};
@@ -315,6 +321,9 @@ void OS_Log_Flush(){
 void OS_CustomLog(const Eventinfo *lf, const char *format, KafkaProducerConfig* tmp_kafka_producer)
 {
     //aflog
+    if(tmp_kafka_producer == NULL)
+        return;
+
     char *log;
     char *tmp_log;
     char tmp_buffer[1024];
@@ -404,6 +413,8 @@ void OS_InitFwLog()
 int FW_Log(Eventinfo *lf, KafkaProducerConfig* tmp_kafka_producer)
 {
     //fflog
+    if(tmp_kafka_producer == NULL)
+        return;
     /* Set the actions */
     switch (*lf->action) {
         /* discard, drop, deny, */
